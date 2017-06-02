@@ -158,14 +158,21 @@ class SymfonyTestsListener extends \PHPUnit_Framework_BaseTestListener
     public function startTest(\PHPUnit_Framework_Test $test)
     {
         if (-2 < $this->state && $test instanceof \PHPUnit_Framework_TestCase) {
+            // This event is triggered before the test is re-run in isolation.
+            // Therefore, we must not set up an expectation for tests that will
+            // be run again in isolation.
+            $will_be_isolated = $this->willBeIsolated($test);
+
             $groups = \PHPUnit_Util_Test::getGroups(get_class($test), $test->getName(false));
 
-            if (in_array('time-sensitive', $groups, true)) {
-                ClockMock::register(get_class($test));
-                ClockMock::withClockMock(true);
-            }
-            if (in_array('dns-sensitive', $groups, true)) {
-                DnsMock::register(get_class($test));
+            if (!$will_be_isolated) {
+                if (in_array('time-sensitive', $groups, true)) {
+                    ClockMock::register(get_class($test));
+                    ClockMock::withClockMock(true);
+                }
+                if (in_array('dns-sensitive', $groups, true)) {
+                    DnsMock::register(get_class($test));
+                }
             }
 
             $annotations = \PHPUnit_Util_Test::parseTestMethodAnnotations(get_class($test), $test->getName(false));
@@ -177,14 +184,21 @@ class SymfonyTestsListener extends \PHPUnit_Framework_BaseTestListener
                 if (!in_array('legacy', $groups, true)) {
                     $test->getTestResultObject()->addError($test, new \PHPUnit_Framework_AssertionFailedError('Only tests with the `@group legacy` annotation can have `@expectedDeprecation`.'), 0);
                 }
-                $this->expectedDeprecations = $annotations['method']['expectedDeprecation'];
-                $this->previousErrorHandler = set_error_handler(array($this, 'handleError'));
+                if (!$will_be_isolated) {
+                    $this->expectedDeprecations = $annotations['method']['expectedDeprecation'];
+                    $this->previousErrorHandler = set_error_handler(array($this, 'handleError'));
+                }
             }
         }
     }
 
     public function endTest(\PHPUnit_Framework_Test $test, $time)
     {
+        // If the test ran in isolation, mark it as risky.
+        if ($this->willBeIsolated($test)) {
+            $test->getTestResultObject()->addError($test, new \PHPUnit_Framework_RiskyTestError('Process-isolated tests might yield a false pass for `@expectedDeprecation`.'), 0);
+            return;
+        }
         if ($this->expectedDeprecations) {
             if (!in_array($test->getStatus(), array(\PHPUnit_Runner_BaseTestRunner::STATUS_SKIPPED, \PHPUnit_Runner_BaseTestRunner::STATUS_INCOMPLETE), true)) {
                 $test->addToAssertionCount(count($this->expectedDeprecations));
@@ -228,4 +242,25 @@ class SymfonyTestsListener extends \PHPUnit_Framework_BaseTestListener
         }
         $this->gatheredDeprecations[] = $msg;
     }
+
+    /**
+     * Determines if a test will be run in isolation.
+     *
+     * @param \PHPUnit_Framework_Test $test The test in question.
+     *
+     * @return bool TRUE if we expect this test to run in isolation, FALSE
+     *   otherwise.
+     */
+    protected function willBeIsolated(\PHPUnit_Framework_Test $test)
+    {
+        if (!function_exists('__phpunit_run_isolated_test')) {
+            if ($test instanceof \PHPUnit_Framework_TestCase) {
+                $ref_isolated = new \ReflectionProperty($test, 'runTestInSeparateProcess');
+                $ref_isolated->setAccessible(TRUE);
+                return $ref_isolated->getValue($test);
+            }
+        }
+        return FALSE;
+    }
+
 }
